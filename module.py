@@ -12,6 +12,8 @@ import queue
 from transformers import T5Tokenizer, T5ForConditionalGeneration
 from model_utils import *
 
+import ctranslate2
+
 
 '''
     Model Classes
@@ -59,18 +61,47 @@ class rag_retreiver():
 
 # OPT model class 
 class opt_model():
-    def __init__(self,model_path,device = torch.device("cuda:1")):
+    def __init__(self,model_path,device = torch.device("cuda:1"),ct2_path=None,is_server = False,device_index = [0,1,3],n_stream = 3):
         super(opt_model,self).__init__()
-        # self.device = torch.device("cuda:0")
         self.device = device
-        self.model = OPTForCausalLM.from_pretrained(model_path).to(self.device)
-        self.tokenizer = GPT2Tokenizer.from_pretrained(model_path)
-    def text_gen(self,input_text:str,max_len:int = 200):
-        inputs = self.tokenizer(input_text, return_tensors="pt").to(self.device)
-        # outputs = self.model.generate(**inputs,max_length = max_len,do_sample = True,early_stopping = False,temperature=0.8, top_p = 0.9)
-        outputs = self.model.generate(**inputs,penalty_alpha=0.6, top_k = 4,max_length=max_len)
-        out_text = self.tokenizer.batch_decode(outputs,skip_special_tokens = True)[0]
-        return out_text
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        if(ct2_path != None):
+            if(is_server):
+                self.model = ctranslate2.Generator(ct2_path, compute_type="float16",device = "cuda",device_index = device_index,inter_threads=n_stream,max_queued_batches = -1 )
+                # self.model = ctranslate2.Generator(ct2_path, compute_type="float16",device = "cuda",device_index = [0],inter_threads=3, max_queued_batches = -1)
+                # self.model = ctranslate2.Generator(ct2_path, compute_type="float16",device = "cuda",device_index = [0],inter_threads=3)
+                self.deploy = "ct2-server"
+            else:  
+                self.model = ctranslate2.Generator(ct2_path, compute_type="float16",device = "cuda",device_index = self.device.index)
+                self.deploy = "ct2"
+        else:
+            self.model = OPTForCausalLM.from_pretrained(model_path).to(self.device)
+            self.deploy = "cuda"
+        print(f"[OPT_MODEL] Deployment: {self.deploy}")
+        if(self.deploy == "ct2-server"):
+            print(f"[OPT_MODEL] Device Index: {device_index}")
+            print(f"[OPT_MODEL] CUDA Streams: {n_stream}")
+        
+        
+    def text_gen(self,input_text:str,max_len:int = 200) -> str:
+        if(self.deploy == "cuda"):
+            inputs = self.tokenizer(input_text, return_tensors="pt").to(self.device)
+            # outputs = self.model.generate(**inputs,max_length = max_len,do_sample = True,early_stopping = False,temperature=0.8, top_p = 0.9)
+            outputs = self.model.generate(**inputs,penalty_alpha=0.6, top_k = 4,max_length=max_len)
+            out_text = self.tokenizer.batch_decode(outputs,skip_special_tokens = True)[0]
+            return out_text
+        elif(self.deploy == "ct2"):
+            start_tokens = self.tokenizer.convert_ids_to_tokens(self.tokenizer.encode(input_text))
+            # results = self.model.generate_batch([start_tokens],beam_size=5,max_length = max_len)
+            results = self.model.generate_batch([start_tokens], max_length=max_len, sampling_topk=10)
+            output = self.tokenizer.decode(results[0].sequences_ids[0],skip_special_tokens = True)
+            return output.replace("<s>","")
+        else:
+            start_tokens = self.tokenizer.convert_ids_to_tokens(self.tokenizer.encode(input_text))
+            results = self.model.generate_batch([start_tokens], max_length=max_len, sampling_topk=10,asynchronous=True)
+            while(results[0].done()!=True):
+                pass
+            return  self.tokenizer.decode(results[0].result().sequences_ids[0])
     def prepare_prompt(self, context:str,question:str) -> str :
         """prepares prompt based on type of question - factoid, causal or listing"""
         factoid = ["What", "Where", "When", "Explain", "Discuss", "Clarify"]
@@ -94,7 +125,36 @@ class opt_model():
         return prompt
     def answer_question(self,context:str,question:str,max_len:int = 300):
         prompt = self.prepare_prompt(context, question)
+        # prompt = "Answer question from context:" + context.replace("\n"," ") + "\nQuestion:" + question.replace("\n"," ") + "\nAnswer:"
         return self.text_gen(prompt,max_len).split("\nAnswer:")[1]
+    
+    def _text_gen_server(self,input_text:str,max_len:int=200):
+        start_tokens = self.tokenizer.convert_ids_to_tokens(self.tokenizer.encode(input_text))
+        results = self.model.generate_batch([start_tokens], max_length=max_len, sampling_topk=10,asynchronous=True)
+        return results
+    def _answer_question_server(self,context:str,question:str,max_len:int=300):
+        prompt = self.prepare_prompt(context, question)
+        return self._text_gen_server(prompt,max_len)
+    
+    def answer_question_all(self,context_list,question:str,n_ans:int,max_len:int):
+        ans_list = []
+        if(self.deploy == "ct2-server"):
+            temp_list = []
+            for i in range(n_ans):
+                temp_list.append(self._answer_question_server(context_list[i],question,max_len))
+            while(False in [judge[0].done() for judge in temp_list]):
+                pass
+            
+            for temp_ans in temp_list:
+                ans_list.append(self.tokenizer.decode(temp_ans[0].result().sequences_ids[0]).split("\nAnswer:")[1])
+                
+            return ans_list
+        else:
+            for i in range(n_ans):
+                out_ans = self.answer_question(context_list[i],question,max_len)
+                ans_list.append(out_ans)
+            return ans_list
+        
     def train_loss_ids(self,input_ids,label_ids):
         data = input_ids.to(self.device)
         outputs = self.model(data,labels = data)
@@ -233,3 +293,4 @@ class qr_model():
         outputs = self.model.generate(inputs)
         out_text = self.tokenizer.batch_decode(outputs,skip_special_tokens = True)[0]
         return out_text
+
