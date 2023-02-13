@@ -83,7 +83,7 @@ class opt_model():
             print(f"[OPT_MODEL] CUDA Streams: {n_stream}")
         
         
-    def text_gen(self,input_text:str,max_len:int = 200) -> str:
+    def text_gen(self,input_text:str,max_len:int = 200) -> str: 
         if(self.deploy == "cuda"):
             inputs = self.tokenizer(input_text, return_tensors="pt").to(self.device)
             # outputs = self.model.generate(**inputs,max_length = max_len,do_sample = True,early_stopping = False,temperature=0.8, top_p = 0.9)
@@ -114,10 +114,12 @@ class opt_model():
             Context : """ + context.replace("\n"," ") + "\nQuestion:" + question.replace("\n"," ") + "\nAnswer:"
         elif any(word in question for word in causal):
             prompt = """Generate a procedural, knowledgeable and reasoning-based answer about this question, based on the given context. 
-            The answer must use inference mechanisms and logic to subjectively discuss the topic. It should be creative and logic-oriented, analytical and extensive. Context :""" + context.replace("\n"," ") + "\nQuestion:" + question.replace("\n"," ") + "\nAnswer:"
+            The answer must use inference mechanisms and logic to subjectively discuss the topic. It should be creative and logic-oriented, analytical and extensive. 
+            Context : """ + context.replace("\n"," ") + "\nQuestion:" + question.replace("\n"," ") + "\nAnswer:"
         elif any(word in question for word in listing):
             prompt = """Generate a list-type, descriptive answer to this question, based on the given context. 
-            The answer should be very detailed and contain reasons, explanations and elaborations about the topic. It should be interesting and use advanced vocabulary and complex sentence structures. Context :""" + context.replace("\n"," ") + "\nQuestion:" + question.replace("\n"," ") + "\nAnswer:"
+            The answer should be very detailed and contain reasons, explanations and elaborations about the topic. It should be interesting and use advanced vocabulary and complex sentence structures. 
+            Context : """ + context.replace("\n"," ") + "\nQuestion:" + question.replace("\n"," ") + "\nAnswer:"
         else:
             prompt = """Generate a detailed, interesting answer to this question, based on the given context. 
             The answer must be engaging and provoke interactions. It should use academic language and a formal tone. 
@@ -132,9 +134,25 @@ class opt_model():
         start_tokens = self.tokenizer.convert_ids_to_tokens(self.tokenizer.encode(input_text))
         results = self.model.generate_batch([start_tokens], max_length=max_len, sampling_topk=10,asynchronous=True)
         return results
-    def _answer_question_server(self,context:str,question:str,max_len:int=300):
+    def _answer_question_server(self,context:str,question:str,max_len:int=300):       
         prompt = self.prepare_prompt(context, question)
-        return self._text_gen_server(prompt,max_len)
+        # return self._text_gen_server(prompt,max_len)
+        
+        # Cut off retrieved context within the max_len limit
+        origin_context = prompt.split('Context : ')[1].split('\nQuestion:')[0]
+        context_length = len(self.tokenizer.encode(origin_context))
+        prompt_length = len(self.tokenizer.encode(prompt))
+        fixed_prompt_length = prompt_length - context_length
+        remain_avail_context_length = max_len - fixed_prompt_length - 2
+        if context_length > remain_avail_context_length:
+            new_encoded_context = self.tokenizer.encode(origin_context)[:remain_avail_context_length]
+            new_context = self.tokenizer.decode(new_encoded_context)
+            pmt, ctx = prompt.split('Context : ')
+            ctx, qes = ctx.split('\nQuestion:')
+            new_prompt = pmt + "Context : " + new_context + "\nQuestion:" + qes
+            return self._text_gen_server(new_prompt,max_len)
+        else:
+            return self._text_gen_server(prompt,max_len)
     
     def answer_question_all(self,context_list,question:str,n_ans:int,max_len:int):
         ans_list = []
@@ -147,7 +165,7 @@ class opt_model():
             
             for temp_ans in temp_list:
                 ans_list.append(self.tokenizer.decode(temp_ans[0].result().sequences_ids[0]).split("\nAnswer:")[1])
-                
+                              
             return ans_list
         else:
             for i in range(n_ans):
